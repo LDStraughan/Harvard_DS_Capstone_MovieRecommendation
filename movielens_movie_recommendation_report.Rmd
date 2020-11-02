@@ -1,0 +1,512 @@
+---
+title: "Movielens"
+author: "Luke Straughan"
+date: "23/03/2020"
+output:
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+``` 
+```{r memlimit, include=FALSE}
+memory.limit(64000)
+```
+# Introduction
+This report is one of the capstone assignments in the Harvard edX Data Science course. The goal is to create a machine learning algorithm to accurately predict movie ratings and would, therefore, be able to recommend films to users. The dataset was provided by the edX team. It is the Movielens data set that contains approximately 10 Million movie recommendations. It contains information such as user IDs, movie IDs, the titles of said movies (which include the year in which they were realeased), the genres of said movies, the ratings that each user has given a movie, and the timestamp of the time in which the rating was made. Firstly, data wrangling took place in order to attain the data. This was done entirely with the code provided by the edX team. Secondly, the data is analysed, primarily through data visualisation techniques. Throughout this process, more data cleaning takes place as further columns are added to the data set, such as pulling the year from the title and the date from the timestamp in order to make it readable to humans. Thirdly, the effects model, along with regularisation, is used to create the overall model through which the data can be processed and predictions can be made. Following that section, the results will be tested on the validation set and a final RMSE (root mean square error) can be made. The ultimate goal, and test to see whether the modelling is effective, is to have the RMSE below 0.86490. As aforementioned, however, the process starts with the data wrangling.
+
+# Data Wrangling
+The following code was provided by the edX team:
+```{r edx team, echo=TRUE}
+################################
+# Create edx set, validation set
+################################
+
+# Note: this process could take a couple of minutes
+
+if(!require(tidyverse)) install.packages("tidyverse", repos = "http://cran.us.r-project.org")
+if(!require(caret)) install.packages("caret", repos = "http://cran.us.r-project.org")
+if(!require(data.table)) install.packages("data.table", repos = "http://cran.us.r-project.org")
+
+# MovieLens 10M dataset:
+# https://grouplens.org/datasets/movielens/10m/
+# http://files.grouplens.org/datasets/movielens/ml-10m.zip
+
+dl <- tempfile()
+download.file("http://files.grouplens.org/datasets/movielens/ml-10m.zip", dl)
+
+ratings <- fread(text = gsub("::", "\t", readLines(unzip(dl, "ml-10M100K/ratings.dat"))),
+                 col.names = c("userId", "movieId", "rating", "timestamp"))
+
+movies <- str_split_fixed(readLines(unzip(dl, "ml-10M100K/movies.dat")), "\\::", 3)
+colnames(movies) <- c("movieId", "title", "genres")
+movies <- as.data.frame(movies) %>% mutate(movieId = as.numeric(levels(movieId))[movieId],
+                                           title = as.character(title),
+                                           genres = as.character(genres))
+
+movielens <- left_join(ratings, movies, by = "movieId")
+
+# Validation set will be 10% of MovieLens data
+set.seed(1, sample.kind="Rounding")
+# if using R 3.5 or earlier, use `set.seed(1)` instead
+test_index <- createDataPartition(y = movielens$rating, times = 1, p = 0.1, list = FALSE)
+edx <- movielens[-test_index,]
+temp <- movielens[test_index,]
+
+# Make sure userId and movieId in validation set are also in edx set
+validation <- temp %>% 
+  semi_join(edx, by = "movieId") %>%
+  semi_join(edx, by = "userId")
+
+# Add rows removed from validation set back into edx set
+removed <- anti_join(temp, validation)
+edx <- rbind(edx, removed)
+
+rm(dl, ratings, movies, test_index, temp, movielens, removed)
+```
+The above code downloads and cleans the data in order to make it easier to work with. Then, the dataset is split up into two sets - the training set (edx) and the testing set (validation). 90% of the data remains in the edx set while 10% is assigned to the validation set that will be used to test the final results of the modelling.
+
+# Data Analysis
+```{r themes, include=FALSE}
+# Themes for visualisation
+if(!require(ggthemes)) install.packages("ggthemes")
+```
+Here the data is checked to see what variables one has to work with.
+```{r check, echo=FALSE}
+# Check data
+edx %>% as_tibble()
+```
+
+In order to make the timestamp analysable for humans, it is converted into date-time, which is then used to create the $week$ column. This is intended to avoid overfitting the data by making the date broader. Then, the $year$ column is created by extracting it from the title. This will allow the year to be its own variable for the data visualisation.
+```{r clean, echo=TRUE}
+# Timestamp to date-time
+if(!require(lubridate)) install.packages("lubridate")
+edx <- mutate(edx, date = as_datetime(timestamp))
+edx %>% as_tibble()
+
+# Add week column to edx
+edx <- edx %>% mutate(week = round_date(as_datetime(timestamp), unit = "week"))
+
+# Add year column
+edx <- edx %>% mutate(year = as.numeric(str_sub(title,-5,-2)))
+edx %>% as_tibble()
+
+# Check for missing values
+any(is.na(edx))
+```
+
+After splitting the original dataset into two sets, the number of unique users and movies will have lessened.
+
+```{r uniqueui, echo=FALSE}
+# Number of unique users and movies
+edx %>% summarize(n_users = n_distinct(userId), 
+                  n_movies = n_distinct(movieId))
+```
+
+It is important to ensure that the set still varies enough to be useful. A randome sample of users and movies will do this.
+
+```{r randomui, echo=FALSE}
+# Sparse matrix for 100 random, unique userId and moveiId
+users <- sample(unique(edx$userId), 100)
+rafalib::mypar()
+edx %>% filter(userId %in% users) %>% 
+  select(userId, movieId, rating) %>%
+  mutate(rating = 1) %>%
+  spread(movieId, rating) %>% select(sample(ncol(.), 100)) %>% 
+  as.matrix() %>% t(.) %>%
+  image(1:100, 1:100,. , xlab="Movies", ylab="Users")
+abline(h=0:100+0.5, v=0:100+0.5, col = "grey")
+```
+
+Below, one can see that a fairly standard distribution is followed when considering the amount of ratings a film has.
+
+```{r distributionr, echo=FALSE}
+# Distribution of ratings
+edx %>% 
+  dplyr::count(movieId) %>% 
+  ggplot(aes(n)) + 
+  geom_histogram(bins = 30, col = "black") + 
+  scale_x_log10() + 
+  ggtitle("Distribution of Ratings")
+```
+
+The following films are the films with the most amount of ratings. One can see that they were primarily released between 1991 and 1995 - with the exception of Star Wars in 1997.
+
+```{r topfilmsnr, echo=FALSE}
+# Top movies by ratings count
+edx %>% group_by(movieId, title) %>%
+  summarize(rating_count = n(),
+            avg_rating = mean(rating)) %>%
+  arrange(desc(rating_count))
+```
+
+Below depicts the films that have the highest average rating. Films from classical Hollywood seem to be especially well-rated.
+
+```{r topfilmsar, echo=FALSE}
+# Top movies by average rating (with at least 1000 ratings)
+edx %>%
+  group_by(movieId, title) %>%
+  summarise(rating_count = n(),
+            avg_rating = mean(rating)) %>%
+  filter(rating_count >= 1000) %>%
+  arrange(desc(avg_rating))
+```
+
+By looking at which ratings are most and least popular, one can see that the higher ratings are, on average, more popular than the lower ratings. Therefore, it can be inferred that users are more likely to rate the films that they enjoy than the ones that they do not. This is still helpful, however, as the goal is to recommend the users films that they enjoy, not inform them of films that they are likely to dislike. It is also notable that whole numbers, such as 4.0, 3.0 and 5.0, are distinctly more popular than fractions, such as 4.5, 3.5, etc.
+
+```{r popratings, echo=FALSE}
+# Most to least popular ratings 
+edx %>% group_by(rating) %>% 
+  summarize(rating_count = n()) %>%
+  arrange(desc(rating_count))
+```
+```{r edxgenre, include=FALSE}
+# Seperate genres
+edx_genre <- edx %>% separate_rows(genres, sep = "\\|") # separating genres may take some time
+head(edx_genre)
+```
+
+It is important to note that the two genres with significantly more ratings than the rest, Drama and Comedy, are both relatively broad genres that can be assigned to many films.
+
+```{r genrenr, echo=FALSE}
+# No. of ratings per genre 
+edx_genre %>%
+  group_by(genres) %>%
+  summarize(rating_count = n()) %>%
+  arrange(desc(rating_count)) # Drama & Comedy are broad genres
+```
+```{r genrey, include=FALSE}
+# Genre popularity per year
+genre_popularity <- edx_genre %>%
+  select(movieId, year, genres, rating) %>%
+  mutate(genres = as.factor(genres)) %>% 
+  group_by(year, genres) %>% 
+  summarise(rating_count = n(), 
+            avg_rating = mean(rating), 
+            se = sd(rating)/sqrt(n()))
+genre_popularity %>% as_tibble()
+```
+
+The following two graphs show that a corellation exists between genre and time. A limited number of genres will be used in order to ensure that the graph is intelligable. The chosen genres are drama, comedy, action, horror, thriller & sci-fi.
+
+```{r genretnr, echo=FALSE}
+# Genres over time (no. of ratings)
+genre_popularity %>%
+  filter(genres %in% c("Drama", "Comedy", "Action", "Horror", "Thriller", "Sci-Fi")) %>%
+  ggplot(aes(year, rating_count)) +
+  geom_line(aes(col=genres)) +
+  ggtitle("Genre Popularity Over Time (no. of ratings)")
+```
+
+One can see that there are definite trends in genre popularity over time.
+
+```{r genretar, echo=FALSE}
+# Genres over time (average rating)
+genre_popularity %>%
+  filter(genres %in% c("Drama", "Comedy", "Action", "Horror", "Thriller", "Sci-Fi")) %>%
+  ggplot(aes(year, avg_rating)) +
+  geom_point(aes(color=genres)) +
+  geom_smooth(aes(color=genres), alpha = 0) +
+  ggtitle("Genre Popularity Over Time (average rating)")
+```
+
+In the following two graphs, one can see the relationship that ratings have with genres and year, respectively.
+
+```{r ratinggenre, echo=FALSE}
+# Rating vs genres
+edx_genre %>% group_by(genres) %>%
+  summarize(rating_count = n(), 
+            avg_rating = mean(rating), 
+            se = sd(rating)/sqrt(n())) %>%
+  filter(rating_count >= 1000) %>% 
+  mutate(genres = reorder(genres, avg_rating)) %>%
+  ggplot(aes(x = genres, 
+             y = avg_rating, 
+             ymin = avg_rating - 20*se, 
+             ymax = avg_rating + 20*se, 
+             col = rating_count)) + 
+  geom_point(size = 2) +
+  geom_errorbar(size = 1.25) + 
+  theme_gdocs() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+  ggtitle("Average Rating Per Genre")
+```
+
+The results seen below reflect our previous findings that the average rating of classical Hollywood films tends to be particularly high. Furthermore, there is a definite correlation between the rating of a film and the time in which it was released.
+
+```{r ratingyear, echo=FALSE}
+# Rating vs year 
+edx %>% group_by(year) %>%
+  summarize(avg_rating = mean(rating)) %>%
+  ggplot(aes(year, avg_rating)) +
+  geom_point() +
+  geom_smooth() +
+  ggtitle("Average Rating Per Year")
+```
+
+The following graph is similar to the one shown earlier that ploted the disrtibution of movies that have been rated. The graph below depicts the amount of ratings that users tend to make - with most users rating approximately 50 movies. This should still be enough ratings to predict fairly accurately what films each user might enjoy.
+
+```{r distributionu, echo=FALSE}
+# Distribution of users
+edx %>%
+  dplyr::count(userId) %>% 
+  ggplot(aes(n)) + 
+  geom_histogram(bins = 30, col = "black") + 
+  scale_x_log10() +
+  ggtitle("Distribution of Users")
+```
+
+The following depicts the users with the most amount of ratings. One can see that the average ratings given by the users that rate the most fits well with the numbers provided for the average ratings of films per year. Naturally, these individuals and their film tastes will have a greater impact on the average ratings per year. Considering each user individually, however, will still ensure that users with similar tastes will be recommended similar films.
+
+```{r topu, echo=FALSE}
+# Top Users (with at least 100 ratings)
+edx %>%
+  group_by(userId) %>%
+  summarise(rating_count = n(),
+            avg_rating = mean(rating)) %>%
+  filter(rating_count >= 100) %>%
+  arrange(desc(rating_count))
+```
+
+# Modelling
+To begin the modelling phase, the edx data set is split into a training set and a test set. Much like the partitioning of the original edx data into the edx and validation set, 90% is assigned to edx_train and 10% is assigned to edx_test. This is done so that the validation set is only used for the final testing.
+```{r train & test, echo=TRUE}
+# Create a train & test set from edx
+edx_test_index <- createDataPartition(y = edx$rating, times = 1, p = 0.1, list = FALSE)
+edx_train <- edx[-edx_test_index,]
+edx_test <- edx[edx_test_index,]
+```
+
+
+## RMSE function
+A function is then created through which the RMSE can be calculated. Additionally, the mu object is created as it is needed for the effects model that will be elaborated upon in the next section.
+```{r rmse, echo=TRUE}
+# Create a rmse function
+RMSE <- function(true_ratings, predicted_ratings){
+  sqrt(mean((true_ratings - predicted_ratings)^2,na.rm = T))
+}
+
+# Calculate mu
+mu <- mean(edx_train$rating)
+```
+
+The predicted RMSE, without the effects modelling is:
+```{r predictrmse, echo=FALSE}
+# Predict rmse on edx_test set
+RMSE_pred <- RMSE(edx_test$rating, mu)
+RMSE_pred
+```
+This is substantially higher than our objective RMSE: 0.86490.
+
+## Effects model
+As aforementioned, an effects model is used here to create the recommendation system. This model has been used in the Harvard edX data science course, however extra effects have been incorporated. The model can be represented as $$y_{i,u,g,t} = \mu + b_i + b_u + b_g + b_t + \epsilon_{i,u,g,t}$$. 
+
+The movie effect - or item effect as it is referred to by contributers to solution that won the Netflix Grand Prize (Koren 2009: 1) - is created in the b_i object. This is the effect that considers how each film is rated.
+```{r movieeffect, echo=TRUE}
+# Movie effect
+b_i <- edx_train %>%
+  group_by(movieId) %>%
+  summarize(b_i = mean(rating - mu)) # b_i = movie/item effect
+qplot(b_i, geom = "histogram", col = I("black"), data = b_i)
+```
+
+The predicted RMSE using only the movie effect is:
+```{r predmovieeffect, echo=FALSE}
+predicted_ratings_movie <- edx_test %>%
+  left_join(b_i, by="movieId") %>%
+  mutate(pred = mu + b_i) %>%
+  pull(pred)
+rmse_movie <- RMSE(predicted_ratings_movie, edx_test$rating) 
+rmse_movie # predicted rmse for movie effect
+```
+Naturally, this is better than the predicted RMSE without any modelling, but it is still significantly higher than our objective.
+
+The user effect is denoted as b_u. This effect considers how each user rates films and so would be able to pair users with similar tastes.
+```{r usereffect, echo=TRUE}
+# User effect
+b_u <- edx_train %>%
+  left_join(b_i, by="movieId") %>%
+  group_by(userId) %>%
+  summarize(b_u = mean(rating - b_i - mu)) # b_u = user effect
+qplot(b_u, geom = "histogram", col = I("black"), data = b_u)
+```
+
+The predicted RMSE using only the user effect is:
+```{r predusereffect, echo=FALSE}
+predicted_ratings_user <- edx_test %>%
+  left_join(b_i, by="movieId") %>%
+  left_join(b_u, by="userId") %>%
+  mutate(pred = mu + b_u) %>%
+  pull(pred)
+rmse_user <- RMSE(predicted_ratings_user, edx_test$rating)
+rmse_user # predicted rmse for user effect
+```
+It is clear that a single effect will not be suitable to attain our objective RMSE.
+
+The genre effect is denoted as b_g.
+```{r genreeffect, echo=TRUE}
+# Genre effect
+b_g <- edx_train %>%
+  left_join(b_i, by="movieId") %>%
+  left_join(b_u, by="userId") %>%
+  group_by(genres) %>%
+  summarise(b_g = mean(rating - b_i - b_u - mu)) # b_g = genre effect
+qplot(b_g, geom = "histogram", col = I("black"), data = b_g)
+```
+
+The predicted RMSE using only the genre effect is:
+```{r predgenreeffect, echo=FALSE}
+predicted_ratings_genre <- edx_test %>%
+  left_join(b_i, by="movieId") %>%
+  left_join(b_u, by="userId") %>%
+  left_join(b_g, by="genres") %>%
+  mutate(pred = mu + b_g) %>%
+  pull(pred)
+rmse_genre <- RMSE(predicted_ratings_genre, edx_test$rating)
+rmse_genre # predicted rmse for genre effect
+```
+Surprisingly, this is barely an imporovement on the predicted RMSE without any modelling. Therefore, the genre effect by itself will have little effect on creating an adequite recommendation system. However, in combination with the other effects, considering genre will assist in optimisng the accuracy of our recommendation system. This is evident by considering the noticeable trends in genre in the data analysis section.
+
+The time effect is denoted as b_t. This is the time in which the rating is made.
+```{r timeeffect, echo=TRUE}
+# Time effect
+b_t <- edx_train %>%
+  left_join(b_i, by="movieId") %>%
+  left_join(b_u, by="userId") %>%
+  left_join(b_g, by="genres") %>%
+  group_by(week) %>%
+  summarize(b_t = mean(rating - b_i - b_u - b_g - mu)) # b_t = time effect
+qplot(b_t, geom = "histogram", col = I("black"), data = b_t)
+```
+
+The predicted RMSE using only the time effect is:
+```{r predtimeeffect, echo=FALSE}  
+predicted_ratings_time <- edx_test %>%
+  left_join(b_i, by="movieId") %>%
+  left_join(b_u, by="userId") %>%
+  left_join(b_g, by="genres") %>%
+  left_join(b_t, by = "week") %>%
+  mutate(pred = mu + b_t) %>%
+  pull(pred)
+rmse_time <- RMSE(predicted_ratings_time, edx_test$rating)
+rmse_time # predicted rmse for time effect
+```
+This is even higher than the genre effect. Nonetheless, as with genre, when combined with the other effects, this can only aid in optimising the recommendation system.
+
+The next step is to optimise the tuning parameters for the final models. This is done by considering multiple lambdas - from 0 to 10 in intervals of 0.25 and finding which results in the minimum RMSE.
+```{r optimisetuning, echo=TRUE}
+# Optimise tuning parameters
+lambdas <- seq(0, 10, 0.25)
+rmses <- sapply(lambdas, function(l){
+  b_i <- edx_train %>% 
+    group_by(movieId) %>%
+    summarize(b_i = sum(rating - mu)/(n() + l)) 
+  b_u <- edx_train %>% 
+    left_join(b_i, by="movieId") %>%
+    group_by(userId) %>%
+    summarize(b_u = sum(rating - b_i - mu)/(n() + l)) 
+  b_g <- edx_train %>%
+    left_join(b_i, by="movieId") %>%
+    left_join(b_u, by="userId") %>%
+    group_by(genres) %>%
+    summarise(b_g = sum(rating - b_i - b_u - mu)/(n() + l))
+  b_t <- edx_train %>%
+    left_join(b_i, by="movieId") %>%
+    left_join(b_u, by="userId") %>%
+    left_join(b_g, by="genres") %>%
+    group_by(week) %>%
+    summarize(b_t = sum(rating - b_i - b_u - b_g - mu)/(n() + l))
+  predicted_ratings <- edx_test %>% 
+    left_join(b_i, by = "movieId") %>% 
+    left_join(b_u, by = "userId") %>%
+    left_join(b_g, by = "genres") %>%
+    left_join(b_t, by = "week") %>%
+    mutate(pred = mu + b_i + b_u + b_g + b_t) %>% 
+    pull(pred)
+  return(RMSE(predicted_ratings, edx_test$rating))
+})
+```
+
+After plotting the RMSEs against the lambdas, one can see that the optimum lambda is somewhere around 5.0.
+
+```{r optimumlambda, echo=FALSE}
+# Optimum lambda = smallest rmse
+qplot(lambdas, rmses)
+```
+
+The minimum RMSE is:
+```{r minrmse, echo=FALSE}
+min(rmses)
+```
+
+This makes the best lambda:
+```{r bestlambda, echo=FALSE}
+best_lambda <- lambdas[which.min(rmses)]
+best_lambda
+```
+
+In the final step of the modelling, this lambda is used to calculate the final models.
+```{r finalmodels, echo=TRUE}
+# Calculate final models with best_lambda
+b_i <- edx_train %>% 
+  group_by(movieId) %>%
+  summarize(b_i = sum(rating - mu)/(n() + best_lambda))
+
+b_u <- edx_train %>% 
+  left_join(b_i, by="movieId") %>%
+  group_by(userId) %>%
+  summarize(b_u = sum(rating - b_i - mu)/(n() + best_lambda))
+
+b_g <- edx_train %>%
+  left_join(b_i, by="movieId") %>%
+  left_join(b_u, by="userId") %>%
+  group_by(genres) %>% 
+  summarise(b_g = sum(rating - b_i - b_u - mu)/(n() + best_lambda))
+
+b_t <- edx_train %>%
+  left_join(b_i, by="movieId") %>%
+  left_join(b_u, by="userId") %>%
+  left_join(b_g, by="genres") %>%
+  group_by(week) %>%
+  summarize(b_t = sum(rating - b_i - b_u - b_g - mu)/(n() + best_lambda))
+```
+
+# Results
+```{r updatevalidation, include=FALSE}
+# Update validation set
+validation <- mutate(validation, date = as_datetime(timestamp)) # add date column to validation
+validation <- validation %>% mutate(week = round_date(as_datetime(timestamp), unit = "week")) # add week column to validation
+validation <- validation %>% mutate(year = as.numeric(str_sub(title,-5,-2))) # add year column to validation
+validation %>% as_tibble()
+
+validation_effects <- validation %>% # add effects variables to validation
+  left_join(b_i, by = "movieId") %>%
+  left_join(b_u, by = "userId") %>%
+  left_join(b_g, by = "genres") %>%
+  left_join(b_t, by = "week")
+```
+Once the validation set has been updated to include the columns added to edx and the effects variables, one can calculate the final RMSE.
+```{r finalrmse, echo=TRUE}
+# Predict ratings for entire effects model
+validation_effects_predict <- validation_effects %>%  
+  mutate(pred = mu + b_i + b_u + b_g + b_t) %>%
+  pull(pred)
+
+# Final rmse
+validation_effects_rmse <- RMSE(validation_effects_predict, validation$rating)
+validation_effects_rmse
+``` 
+
+## Final Results
+The final RMSE is:
+```{r finalresults, echo=FALSE}
+round(validation_effects_rmse, digits = 5)
+```
+
+This successfully achieves the ultimate goal of this assignment to create a model with an RMSE below 0.86490.
+
+# Conclusion
+There are multiple limitations of this report and so many ways in which it could be improved upon. Firstly, more effects variables could be considered. This was limited by the amount of data within the original data set. The best way that this could be improved upon is by including information such as cast and directors/writers as many users will have favourite actors, directors, etc. whose careers they enjoy to follow. More specific genres could also be included, such as heist films or spy-thrillers. Furthermore, categories could be created to include more than genre. An example of this may be films that are popular amongst film critics - a category that exists in Netflix's current system. Additionally, a film's runtime might effect how well it is regarded by certain viewers. Moreover, effects modelling was prioritised in this assignment, but many other techniques may be used and even combined to create a more accurate recommendation system. Non theless, the effects model was outlined in the Netflix prize documentation that guided this assignment and succesfully achieved its ultimate goal.
+
+# Bibliography
+Koren, Y., 2009. The Bellkor Solution to the Netflix Grand Prize. $Netflix Prize Documentation$, 81(2009), pp.1-10.
